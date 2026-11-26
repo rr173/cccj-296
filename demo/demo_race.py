@@ -52,17 +52,20 @@ def _worker(port: int, request_id: str, queue) -> None:
 def main() -> None:
     workdir = Path(tempfile.mkdtemp(prefix="admission_race_"))
     db_path = workdir / "race.db"
-    env = dict(os.environ, LICENSE_DB=str(db_path),
+    env = dict(os.environ,
+               PYTHONPATH=str(Path(__file__).resolve().parents[1]),
+               LICENSE_DB=str(db_path),
                LICENSE_EPOCH="2026-01-01T00:00:00Z")
 
     # 选一个空闲端口
     with socket.socket() as s:
         s.bind(("127.0.0.1", 0))
         port = s.getsockname()[1]
+    env["CENTER_PORT"] = str(port)
 
+    # 无第三方依赖环境使用标准库 HTTP 包装；装有 uvicorn 时也可改回 app.main:app
     server = subprocess.Popen(
-        [sys.executable, "-m", "uvicorn", "app.main:app",
-         "--host", "127.0.0.1", "--port", str(port), "--log-level", "warning"],
+        [sys.executable, "-m", "tools.run_center"],
         cwd=str(Path(__file__).resolve().parents[1]),
         env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
     )

@@ -9,7 +9,7 @@ from fastapi import Depends, FastAPI, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
-from . import db, purchase, service
+from . import db, offline, purchase, service
 from .payment_client import PaymentClient
 
 
@@ -109,6 +109,20 @@ class PurchaseCreate(BaseModel):
 
 class PurchaseCancel(BaseModel):
     cancel_request_id: str = Field(min_length=1)
+
+
+class OfflineIssueRequest(BaseModel):
+    org: str = Field(min_length=1)
+    site_id: str = Field(min_length=1)
+    standard_seats: int = Field(ge=0)
+    premium_seats: int = Field(ge=0)
+    expire_at: str
+    request_id: str = Field(min_length=1)
+
+
+class OfflineReturnRequest(BaseModel):
+    return_credential: dict
+    operation_id: str | None = None
 
 
 # ---------------------------------------------------------------- 路由：时钟
@@ -220,6 +234,29 @@ def cancel_purchase(order_id: str, body: PurchaseCancel, conn=Depends(get_conn),
 @app.get("/orgs/{org}/purchases")
 def org_purchases(org: str, conn=Depends(get_conn)):
     return {"org": org, "orders": purchase.list_orders(conn, org)}
+
+
+# ---------------------------------------------------------------- 路由：离线借席
+
+
+@app.post("/offline/packages/issue")
+def issue_offline_package(body: OfflineIssueRequest, conn=Depends(get_conn)):
+    """签发离线授权包。容量/在线会话约束不满足时返回 issued=false（业务留痕，非 5xx）。"""
+    return offline.issue_package(
+        conn, body.org, body.site_id, body.standard_seats, body.premium_seats,
+        body.expire_at, body.request_id)
+
+
+@app.post("/offline/packages/return")
+def return_offline_package(body: OfflineReturnRequest, conn=Depends(get_conn)):
+    """验证站点交回凭据并提前释放额度；凭据可重送，释放只发生一次。"""
+    return offline.return_package(
+        conn, body.return_credential, body.operation_id)
+
+
+@app.get("/orgs/{org}/offline-packages")
+def org_offline_packages(org: str, conn=Depends(get_conn)):
+    return {"org": org, "packages": offline.list_org_packages(conn, org)}
 
 
 # ---------------------------------------------------------------- 路由：事件流

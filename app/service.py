@@ -101,6 +101,24 @@ def _dump_ent(row: sqlite3.Row) -> dict:
     }
 
 
+# ---------------------------------------------------------------- 离线预留查询
+
+
+def reservation_totals(conn: sqlite3.Connection, org: str, at: str) -> tuple[int, int]:
+    """未交回且在 at 时刻有效的全部离线包合计预留（同组织多包合在一起）。
+
+    左闭右开：issued_at <= at < expire_at 且 status='active'。
+    这些席位在整个借期内都不能再分配给在线会话或其他站点。
+    """
+    row = conn.execute(
+        "SELECT COALESCE(SUM(standard_seats), 0), COALESCE(SUM(premium_seats), 0) "
+        "FROM offline_packages WHERE org = ? AND status = 'active' "
+        "AND issued_at <= ? AND expire_at > ?",
+        (org, at, at),
+    ).fetchone()
+    return row[0], row[1]
+
+
 # ---------------------------------------------------------------- 再平衡引擎
 
 
@@ -111,29 +129,52 @@ class ReconcileResult:
     assignments: dict[str, str]  # 会话 ID -> 占用的 ent_id
 
 
-def reconcile(conn: sqlite3.Connection, org: str) -> ReconcileResult:
-    """按优先顺序重新确定组织内的活跃会话集合。
+@dataclass
+class PlacementPlan:
+    retained: list[str]          # 可保持 active 的会话 ID
+    evicted: list[dict]          # 需撤销的会话及原因
+    assignments: dict[str, str]  # 会话 ID -> 占用的 ent_id
 
-    在调用方已经打开的写事务内执行。每次撤销各取一个事件 seq；
-    席位迁移只落 slot_history（其 assigned/released seq 同样可追溯）。
+
+def _plan_placement(ents: list[sqlite3.Row], sessions: list[sqlite3.Row],
+                    current_ents: dict[str, str],
+                    reserve_standard: int, reserve_premium: int) -> PlacementPlan:
+    """纯函数：给定权益、会话与离线预留，算出安置结果，不做任何写库。
+
+    离线承诺优先：先把预留席位作为「幻影占用」放进池里（高级预留只进高级池，
+    标准预留先占标准池、再溢出到高级池），再按既有优先级贪心安置在线会话。
+    可行性检查保证幻影一定放得下；放不下时钳制为池容量（绝不超发）。
+    由于保留/撤销只取决于各类池的总余量，幻影在权益间如何分布不影响在线
+    会话集合——离线席位不会挡住本可同时容纳的在线会话。
     """
-    at = db.get_clock(conn)
-    ents = _active_entitlements(conn, org, at)
-    sessions = _active_sessions(conn, org)
-
-    # 席位池：ent_id -> [容量, 已用]；按种类分桶
     premium_pools: dict[str, list[Any]] = {
         e["ent_id"]: [e["seats"], 0] for e in ents if e["tier"] == "premium"
     }
     standard_pools: dict[str, list[Any]] = {
         e["ent_id"]: [e["seats"], 0] for e in ents if e["tier"] == "standard"
     }
-    # 保留会话现有的实际占用（每个活跃会话至多一条未释放记录）
-    current_ents: dict[str, str] = {}
-    for s in sessions:
-        slot = _open_slot_for(conn, s["session_id"])
-        if slot is not None:
-            current_ents[s["session_id"]] = slot["ent_id"]
+
+    total_premium = sum(p[0] for p in premium_pools.values())
+    total_standard = sum(p[0] for p in standard_pools.values())
+    r_premium = min(reserve_premium, total_premium)
+    r_standard = min(reserve_standard, total_standard + max(0, total_premium - r_premium))
+
+    def phantom_fill(pools: dict[str, list[Any]], amount: int) -> None:
+        for ent_id in sorted(pools):
+            cap, used = pools[ent_id]
+            take = min(amount, cap - used)
+            if take:
+                pools[ent_id][1] = used + take
+                amount -= take
+            if amount == 0:
+                break
+
+    # 高级预留只能由高级权益支撑
+    phantom_fill(premium_pools, r_premium)
+    # 标准预留：先标准池，富余后再进高级池
+    phantom_fill(standard_pools, r_standard)
+    phantom_fill(premium_pools, max(0, r_standard - sum(
+        min(r_standard, p[0]) for p in standard_pools.values())))
 
     ordered = sorted(
         sessions,
@@ -170,45 +211,74 @@ def reconcile(conn: sqlite3.Connection, org: str) -> ReconcileResult:
                 reason = "no_any_capacity"
 
         if chosen is None:
-            # 撤销：终态落库，释放原占用，写事件（每个撤销独立 seq）
-            seq = next_seq(conn)
-            old = current_ents.get(s["session_id"])
-            conn.execute(
-                "UPDATE sessions SET status='revoked', ended_seq=?, "
-                "end_reason=?, current_cred_id=NULL WHERE session_id=?",
-                (seq, reason, s["session_id"]),
-            )
-            if old is not None:
-                conn.execute(
-                    "UPDATE slot_history SET released_seq=?, release_reason=? "
-                    "WHERE session_id=? AND released_seq IS NULL",
-                    (seq, reason, s["session_id"]),
-                )
-            _emit(
-                conn,
-                "session.revoked",
-                org,
-                {
-                    "session_id": s["session_id"],
-                    "tier": s["tier"],
-                    "reason": reason,
-                    "previous_ent_id": old,
-                },
-                seq=seq,
-            )
             evicted.append(
                 {
                     "session_id": s["session_id"],
                     "tier": s["tier"],
                     "reason": reason,
-                    "previous_ent_id": old,
+                    "previous_ent_id": current_ents.get(s["session_id"]),
                 }
             )
             continue
-
         retained.append(s["session_id"])
         assignments[s["session_id"]] = chosen
 
+    return PlacementPlan(retained=retained, evicted=evicted, assignments=assignments)
+
+
+def reconcile(conn: sqlite3.Connection, org: str) -> ReconcileResult:
+    """按优先顺序重新确定组织内的活跃会话集合（先离线承诺、后在线会话）。
+
+    在调用方已经打开的写事务内执行。每次撤销各取一个事件 seq；
+    席位迁移只落 slot_history（其 assigned/released seq 同样可追溯）。
+    """
+    at = db.get_clock(conn)
+    ents = _active_entitlements(conn, org, at)
+    sessions = _active_sessions(conn, org)
+    reserve_standard, reserve_premium = reservation_totals(conn, org, at)
+
+    # 保留会话现有的实际占用（每个活跃会话至多一条未释放记录）
+    current_ents: dict[str, str] = {}
+    for s in sessions:
+        slot = _open_slot_for(conn, s["session_id"])
+        if slot is not None:
+            current_ents[s["session_id"]] = slot["ent_id"]
+
+    plan = _plan_placement(ents, sessions, current_ents,
+                           reserve_standard, reserve_premium)
+    evicted_ids = {e["session_id"] for e in plan.evicted}
+
+    for ev in plan.evicted:
+        seq = next_seq(conn)
+        old = ev["previous_ent_id"]
+        conn.execute(
+            "UPDATE sessions SET status='revoked', ended_seq=?, "
+            "end_reason=?, current_cred_id=NULL WHERE session_id=?",
+            (seq, ev["reason"], ev["session_id"]),
+        )
+        if old is not None:
+            conn.execute(
+                "UPDATE slot_history SET released_seq=?, release_reason=? "
+                "WHERE session_id=? AND released_seq IS NULL",
+                (seq, ev["reason"], ev["session_id"]),
+            )
+        _emit(
+            conn,
+            "session.revoked",
+            org,
+            {
+                "session_id": ev["session_id"],
+                "tier": ev["tier"],
+                "reason": ev["reason"],
+                "previous_ent_id": old,
+            },
+            seq=seq,
+        )
+
+    for s in sessions:
+        if s["session_id"] in evicted_ids:
+            continue
+        chosen = plan.assignments[s["session_id"]]
         # 席位迁移或首次分配：只落 slot_history，其 seq 可在事件流/历史中核对
         if current_ents.get(s["session_id"]) != chosen:
             if s["session_id"] in current_ents:
@@ -227,7 +297,8 @@ def reconcile(conn: sqlite3.Connection, org: str) -> ReconcileResult:
             (chosen, s["session_id"]),
         )
 
-    return ReconcileResult(retained=retained, evicted=evicted, assignments=assignments)
+    return ReconcileResult(retained=plan.retained, evicted=plan.evicted,
+                           assignments=plan.assignments)
 
 
 # ---------------------------------------------------------------- 会话准入
@@ -603,6 +674,12 @@ def modify_entitlement(conn: sqlite3.Connection, ent_id: str, *, seats: int | No
             raise ServiceError("invalid_window", "expire_at 必须晚于 effective_at", 422)
 
         org = row["org"]
+        # 离线承诺守卫：变更后若任一未交回包在剩余借期无法兑现，整笔拒绝
+        from .offline import _SimEnt, guard_entitlement_change
+        sim = _SimEnt(row, seats=new_seats, effective_at=new_eff, expire_at=new_exp,
+                      version=row["version"] + 1)
+        guard_entitlement_change(conn, org, row["row_id"], sim)
+
         seq = _emit(
             conn,
             "entitlement.modified",
@@ -640,6 +717,9 @@ def revoke_entitlement(conn: sqlite3.Connection, ent_id: str, reason: str) -> di
         if row is None:
             raise ServiceError("entitlement_not_active", "权益不存在或已不在 active 状态", 404)
         org = row["org"]
+        # 离线承诺守卫：撤销会使未交回包无法兑现时整笔拒绝
+        from .offline import guard_entitlement_change
+        guard_entitlement_change(conn, org, row["row_id"], None)
         seq = _emit(conn, "entitlement.revoked", org,
                     {"ent_id": ent_id, "reason": reason, "version": row["version"]})
         conn.execute(

@@ -193,3 +193,59 @@ CREATE TABLE IF NOT EXISTS purchase_money_ops (
     FOREIGN KEY (order_id) REFERENCES purchase_orders(order_id)
 );
 CREATE INDEX IF NOT EXISTS idx_money_ops_order ON purchase_money_ops(order_id, id);
+
+-- ================================================================ 离线借席
+-- 服务级键值表（目前存 HMAC 签名密钥）
+CREATE TABLE IF NOT EXISTS service_meta (
+    key        TEXT PRIMARY KEY,
+    value      TEXT NOT NULL
+);
+
+-- 离线包：组织在中心领取、带到指定站点使用的限时席位授权。
+-- 状态机 active --(交回凭据验证通过)--> returned；expired 由窗口派生不入库。
+-- 只要 status='active' 且当前逻辑时间 < expire_at，其席位就是不可再分配的
+-- 硬性预留（中心在线会话与其他离线包都不能重复使用这份额度）。
+CREATE TABLE IF NOT EXISTS offline_packages (
+    package_id        TEXT PRIMARY KEY,
+    org               TEXT NOT NULL,
+    site_id           TEXT NOT NULL,
+    standard_seats    INTEGER NOT NULL CHECK (standard_seats >= 0),
+    premium_seats     INTEGER NOT NULL CHECK (premium_seats >= 0),
+    issued_at         TEXT NOT NULL,          -- 签发即生效
+    expire_at         TEXT NOT NULL,          -- 该时刻立即失效（左闭右开）
+    request_id        TEXT NOT NULL,
+    return_secret_hash TEXT NOT NULL,         -- 交回凭据内随机秘密的哈希
+    status            TEXT NOT NULL DEFAULT 'active'
+                        CHECK (status IN ('active', 'returned')),
+    created_seq       INTEGER NOT NULL,
+    returned_seq      INTEGER,
+    returned_at       TEXT,
+    UNIQUE (org, request_id)
+);
+CREATE INDEX IF NOT EXISTS idx_offline_org_status
+    ON offline_packages(org, status);
+
+-- 离线签发请求幂等账：同 org 同 request_id 重试必须得到原结果，改参数拒绝。
+-- 被拒请求同样留痕，重试返回第一次的拒绝。
+CREATE TABLE IF NOT EXISTS offline_requests (
+    request_id       TEXT NOT NULL,
+    org              TEXT NOT NULL,
+    site_id          TEXT NOT NULL,
+    standard_seats   INTEGER NOT NULL,
+    premium_seats    INTEGER NOT NULL,
+    expire_at        TEXT NOT NULL,
+    first_status     TEXT NOT NULL CHECK (first_status IN ('issued', 'rejected')),
+    reject_code      TEXT,
+    response_json    TEXT NOT NULL,
+    created_seq      INTEGER NOT NULL,
+    PRIMARY KEY (org, request_id)
+);
+
+-- 交回凭据处理账：凭据可重送，但每个包至多释放一次额度。
+CREATE TABLE IF NOT EXISTS offline_returns (
+    package_id       TEXT PRIMARY KEY,
+    operation_id     TEXT,
+    response_json    TEXT NOT NULL,
+    seq              INTEGER NOT NULL,
+    FOREIGN KEY (package_id) REFERENCES offline_packages(package_id)
+);

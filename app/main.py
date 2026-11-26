@@ -9,7 +9,7 @@ from fastapi import Depends, FastAPI, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
-from . import db, offline, purchase, service
+from . import budget, db, offline, purchase, service
 from .payment_client import PaymentClient
 
 
@@ -123,6 +123,13 @@ class OfflineIssueRequest(BaseModel):
 class OfflineReturnRequest(BaseModel):
     return_credential: dict
     operation_id: str | None = None
+
+
+class BudgetGrantRequest(BaseModel):
+    org: str = Field(min_length=1)
+    amount: int = Field(gt=0)
+    expire_at: str
+    request_id: str = Field(min_length=1)
 
 
 # ---------------------------------------------------------------- 路由：时钟
@@ -257,6 +264,31 @@ def return_offline_package(body: OfflineReturnRequest, conn=Depends(get_conn)):
 @app.get("/orgs/{org}/offline-packages")
 def org_offline_packages(org: str, conn=Depends(get_conn)):
     return {"org": org, "packages": offline.list_org_packages(conn, org)}
+
+
+# ---------------------------------------------------------------- 路由：预付预算
+
+
+@app.post("/budgets/grants", status_code=201)
+def grant_budget(body: BudgetGrantRequest, conn=Depends(get_conn)):
+    """运营发放一笔正整数额度；发放即生效，到期瞬间未用部分作废。"""
+    return budget.grant(conn, body.org, body.amount, body.expire_at, body.request_id)
+
+
+@app.get("/orgs/{org}/budget")
+def org_budget(org: str, conn=Depends(get_conn)):
+    """组织预算总览：每笔额度的可用 / 已用 / 过期未用，以及计费开启时刻。"""
+    return budget.summary(conn, org)
+
+
+@app.get("/orgs/{org}/budget/usage")
+def org_budget_usage(org: str, conn=Depends(get_conn), session_id: str | None = None):
+    """预算用量明细：在线会话 × 时间范围 × 额度来源。"""
+    return {
+        "org": org,
+        "totals": budget.usage_totals(conn, org),
+        "usage": budget.usage(conn, org, session_id),
+    }
 
 
 # ---------------------------------------------------------------- 路由：事件流

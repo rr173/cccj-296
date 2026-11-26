@@ -54,6 +54,7 @@ def connect(db_path: str) -> sqlite3.Connection:
 
 def init_db(conn: sqlite3.Connection) -> None:
     conn.executescript(SCHEMA_PATH.read_text(encoding="utf-8"))
+    _migrate(conn)
     row = conn.execute("SELECT now_iso FROM clock WHERE id = 1").fetchone()
     if row is None:
         initial = os.environ.get("LICENSE_EPOCH")
@@ -61,6 +62,17 @@ def init_db(conn: sqlite3.Connection) -> None:
             "INSERT INTO clock(id, now_iso) VALUES (1, ?)",
             (normalize_ts(initial) if initial else now_wall(),),
         )
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    """对已存在的老库补齐新增列（CREATE TABLE IF NOT EXISTS 不会加列）。
+
+    轻量、幂等：只做 ALTER TABLE ADD COLUMN。老会话的 ended_at 保持 NULL，
+    表示该会话结束于本列引入之前，不影响现有状态与账目。
+    """
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(sessions)")}
+    if "ended_at" not in cols:
+        conn.execute("ALTER TABLE sessions ADD COLUMN ended_at TEXT")
 
 
 def get_clock(conn: sqlite3.Connection) -> str:

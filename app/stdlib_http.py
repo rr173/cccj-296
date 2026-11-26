@@ -9,7 +9,7 @@ from __future__ import annotations
 import json
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-from . import db, offline, service, site_db, site_service
+from . import budget, db, offline, service, site_db, site_service
 
 
 class _CenterHandler(BaseHTTPRequestHandler):
@@ -41,6 +41,22 @@ class _CenterHandler(BaseHTTPRequestHandler):
                 org = self.path.split("/")[2]
                 self._send(200, {"org": org,
                                  "packages": offline.list_org_packages(conn, org)})
+            elif self.path.startswith("/orgs/") and self.path.endswith("/budget"):
+                org = self.path.split("/")[2]
+                self._send(200, budget.summary(conn, org))
+            elif self.path.startswith("/orgs/") and "/budget/usage" in self.path:
+                org = self.path.split("/")[2]
+                sess = None
+                if "session_id=" in self.path:
+                    sess = self.path.split("session_id=", 1)[1].split("&", 1)[0]
+                self._send(200, {
+                    "org": org,
+                    "totals": budget.usage_totals(conn, org),
+                    "usage": budget.usage(conn, org, sess),
+                })
+            elif self.path.startswith("/sessions/") and not self.path.endswith("/sessions"):
+                session_id = self.path.split("/")[2]
+                self._send(200, service.get_session_detail(conn, session_id))
             elif self.path.startswith("/events"):
                 org = None
                 if "org=" in self.path:
@@ -72,6 +88,10 @@ class _CenterHandler(BaseHTTPRequestHandler):
             elif self.path == "/sessions/admit":
                 self._send(200, service.admit_session(
                     conn, body["org"], body["tier"], body["request_id"]))
+            elif self.path == "/budgets/grants":
+                self._send(201, budget.grant(
+                    conn, body["org"], body["amount"], body["expire_at"],
+                    body["request_id"]))
             elif self.path == "/offline/packages/issue":
                 self._send(200, offline.issue_package(
                     conn, body["org"], body["site_id"],

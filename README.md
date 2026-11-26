@@ -49,6 +49,38 @@ Python + FastAPI + SQLite 实现的并行席位授权与会话准入服务。无
 - 主动关闭只释放它 **实际占用的那一份** 额度；重复关闭或晚到的旧会话关闭
   `released=false`，不会释放后来其它会话的额度。
 
+## 预付预算（在线会话计费）
+
+预算与席位**完全分开**：不接支付、不计离线站点用量，只约束中心在线会话。
+运营按组织发放一笔**正整数**额度，指定 UTC 到期时间与 `request_id`。
+
+- **计费开启**：组织第一笔额度发放即开启计费，记下开启时刻 `billable_since`；
+  已有在线会话只从该时刻起计费。未发放过额度的组织沿用原席位规则，不产生扣费。
+- **消耗速率**：沿服务逻辑时钟，每运行 **1 微秒**标准会话消耗 **1** 个最小额度
+  单位、高级会话消耗 **3** 个。
+- **扣费顺序**：优先用**最早到期**的额度，同到期按发放先后；一笔用量可跨多笔
+  额度扣。同一微秒内按现有会话优先次序（高级先于标准 → 开始较早先于较晚 →
+  会话 ID 破同序）依次归属。
+- **额度有效期**：从发放时刻起可用，到期瞬间（左闭右开）未用部分作废，查询里
+  计入该笔额度的「过期未用」。
+- **准入/再平衡**：按现有优先顺序**逐个**考虑会话——只有把它加入已选集合后，
+  既能在离线承诺之外分到席位，又付得起这些会话接下来 1 微秒的费用，才选它。
+  付不起的会话不占席位也不占预算，仍继续考虑后面合格的会话。
+- **预算不足停用**：即使仍有并行席位，付不起的会话以 **`budget_exhausted`**
+  终态撤销，记录精确的停用逻辑时刻（`ended_at`），不能续用，补发额度也不复活。
+  席位不足仍以原有原因（`no_any_capacity` 等）处理。
+- **只对活跃时段扣费**：推进时钟按真实边界（额度到期、权益/席位变化、余额耗尽）
+  切段，跨过余额不足、额度到期或席位变化的时刻就在该边界停用不再合格的会话，
+  不拖到推进终点。例如跨过无席位的空档，即使终点又有席位，原会话也已停用。
+- **一次跨多天 = 分段推进**：中间无其它操作时，两者得到相同的终态、停用时间、
+  扣费归属与合计（账目可有不同分段）。用整除/余数区间一次算出，绝不逐微秒模拟。
+- **不追溯**：主动关闭、权益变化和新准入只改变未来用量，不改变已经发生的扣费。
+- **发放幂等**：同组织同 `request_id` 原样重试返回原发放结果；改金额或到期时间
+  拒绝。被拒请求同样留痕、可重试。
+- **账本**：`budget_charges` 按「会话 × 额度 × 时间范围」记录每笔用量；所有写入
+  与时钟推进在同一写事务内，重启/并发不会重复发放或扣费，也不会留下已推进时钟
+  却未记账、或会话未停用的半成品。
+
 ## 并发与可核对性
 
 所有写操作以 `BEGIN IMMEDIATE` 开启事务，SQLite 全库写锁串行化提交；
@@ -64,8 +96,9 @@ app/
   db.py             中心连接、事务、逻辑时钟、序号
   site_db.py        站点连接与事务（独立 SQLite 文件）
   crypto.py         HMAC-SHA256 信封签名/验签、中心密钥管理
-  service.py        再平衡引擎（含离线预留幻影占用）与在线业务操作
+  service.py        再平衡引擎（含离线预留幻影占用、预算约束）与在线业务操作
   offline.py        中心离线借席：签发、全区间可行性、权益变更守卫、交回
+  budget.py         预付预算：发放/查询、按逻辑时间扣费、真实边界切段与停用
   site_service.py   站点业务：验签导入、本地准入/关闭、到期清扫、提前还席
   main.py           中心 FastAPI 路由
   site_main.py      站点 FastAPI 路由（独立进程）
@@ -75,6 +108,7 @@ demo/
   demo_scenarios.py   本机场景演示（挪用/到期降额/旧凭据/重复关闭/追溯）
   demo_race.py        双进程抢最后一份额度的端到端演示
   demo_offline.py     离线借席双进程端到端演示（借→断网使用→还→重新分配→到期）
+  demo_budget.py      预付预算双进程演示（有席位但预算不足停用、席位途中失效不多扣）
 tools/
   run_center.py / run_site.py  两个独立 OS 进程入口（演示用）
   pytest_shim.py     无 pytest 环境下的兼容运行器
@@ -92,13 +126,16 @@ PYTHONPATH=. python3 -m tools.pytest_shim \
   tests.test_rebalance tests.test_edge_cases tests.test_idempotency \
   tests.test_concurrency tests.test_purchase tests.test_purchase_concurrency
 PYTHONPATH=. python3 -m unittest \
-  tests.test_offline_center tests.test_offline_site tests.test_offline_concurrency
+  tests.test_offline_center tests.test_offline_site tests.test_offline_concurrency \
+  tests.test_budget
 
 # 本机演示（无需起服务，直接操作 SQLite）
 python3 -m demo.demo_scenarios
 python3 -m demo.demo_race
 # 离线借席：自动拉起中心/站点两个真实独立进程，全程显式推进 UTC 时钟
 PYTHONPATH=. python3 -m demo.demo_offline
+# 预付预算：拉起中心进程，演示有席位但预算不足停用、席位途中失效不多扣费
+PYTHONPATH=. python3 -m demo.demo_budget
 
 # HTTP 服务（中心）
 LICENSE_DB=/tmp/admission.db LICENSE_EPOCH=2026-01-01T00:00:00Z \
@@ -126,8 +163,16 @@ LICENSE_SIGNING_KEY=<中心密钥> \
 | POST | `/sessions/{id}/close` | 主动关闭；凭据可选，重复关闭 `released=false` |
 | GET | `/sessions/{id}` | 会话结局、席位轨迹、凭据代次、原始申请 |
 | GET | `/orgs/{org}/sessions` | 组织全部会话（含 revoked/closed 终态） |
-| GET | `/clock` / POST | `/clock/advance` | 读取/推进逻辑时钟（`to` 或 `delta_seconds`，不可回拨） |
+| GET | `/clock` / POST | `/clock/advance` | 读取/推进逻辑时钟（`to` 或 `delta_seconds`，不可回拨）；返回 `charged_units`、`segments` 与本次停用会话 |
 | GET | `/events?org=` | 全局事件流，按 `seq` 体现提交先后 |
+
+### 预付预算接口（中心）
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| POST | `/budgets/grants` | 发放 `{org, amount, expire_at, request_id}`；`amount` 须为正整数，到期须晚于当前逻辑时间；同 request_id 重试返回原发放，改参数拒绝 |
+| GET | `/orgs/{org}/budget` | 预算总览：是否已开启计费、开启时刻、每笔额度的可用/已用/过期未用及合计 |
+| GET | `/orgs/{org}/budget/usage?session_id=` | 用量明细：每行对应在线会话、时间范围、扣自哪笔额度（含欠费段 `grant_id=null`）与单位合计 |
 
 ### 离线借席接口（中心）
 
@@ -161,6 +206,13 @@ curl -s localhost:8000/sessions/admit -H 'Content-Type: application/json' -d '{
 
 curl -s -X POST localhost:8000/clock/advance -H 'Content-Type: application/json' \
   -d '{"delta_seconds": 86400}'
+
+# 预付预算：发放（第一笔开启计费）、推进扣费、查询用量
+curl -s localhost:8000/budgets/grants -H 'Content-Type: application/json' -d '{
+  "org":"acme","amount":1000000,
+  "expire_at":"2026-03-01T00:00:00Z","request_id":"grant-1"}'
+curl -s localhost:8000/orgs/acme/budget
+curl -s localhost:8000/orgs/acme/budget/usage
 ```
 
 ## 数据模型要点
@@ -168,7 +220,11 @@ curl -s -X POST localhost:8000/clock/advance -H 'Content-Type: application/json'
 - `entitlements`：同一 `ent_id` 多版本行，修改插入新版本、旧版本置 `superseded`，
   撤销置 `revoked` 并记录原因，全部历史可追溯。
 - `sessions`：状态机 `active → revoked | closed`（终态）；记录原始 `request_id`、
-  结束序号与原因。
+  结束序号、原因与终态实际发生的逻辑时刻 `ended_at`。
+- `budget_grants`：组织预付额度（金额、发放/到期逻辑时刻、`request_id` 唯一）；
+  `billing_orgs` 记录组织第一笔发放开启计费的时刻 `billable_since`；
+  `budget_charges` 是「会话 × 额度 × 时间范围」的用量账（`grant_id=null` 表示欠费段）；
+  `budget_requests` 是发放幂等账（含被拒留痕），保证并发/重启不重复发放。
 - `credentials`：只存 SHA-256 哈希；续用作废旧代（`consumed`）并签发新代。
 - `admission_requests` / `operations`：准入与续用/关闭的幂等账，保存首次响应原文，
   重试原样返回。

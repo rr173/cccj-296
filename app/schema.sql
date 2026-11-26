@@ -38,6 +38,7 @@ CREATE TABLE IF NOT EXISTS entitlements (
 CREATE INDEX IF NOT EXISTS idx_ent_org ON entitlements(org, status);
 
 -- 会话：状态机 active -> revoked | closed（终态不可逆，权益恢复也不复活）
+-- ended_at：终态实际发生的逻辑时刻（席位失效、预算耗尽、主动关闭都在真实边界写入）
 CREATE TABLE IF NOT EXISTS sessions (
     session_id        TEXT PRIMARY KEY,
     org               TEXT NOT NULL,
@@ -45,6 +46,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     status            TEXT NOT NULL CHECK (status IN ('active', 'revoked', 'closed')),
     created_seq       INTEGER NOT NULL,
     ended_seq         INTEGER,
+    ended_at          TEXT,
     end_reason        TEXT,
     admit_request_id  TEXT NOT NULL,
     current_cred_id   INTEGER,
@@ -248,4 +250,62 @@ CREATE TABLE IF NOT EXISTS offline_returns (
     response_json    TEXT NOT NULL,
     seq              INTEGER NOT NULL,
     FOREIGN KEY (package_id) REFERENCES offline_packages(package_id)
+);
+
+-- ================================================================ 预付预算
+-- 预算与席位完全分开：不接支付、不计离线站点用量，只控制中心在线会话。
+-- 组织第一笔预算发放即开启该组织的计费；未开启的组织沿用原席位规则。
+-- 额度从发放逻辑时刻起可用，到期瞬间（左闭右开）未用部分作废。
+CREATE TABLE IF NOT EXISTS budget_grants (
+    grant_id       TEXT PRIMARY KEY,
+    org            TEXT NOT NULL,
+    amount         INTEGER NOT NULL CHECK (amount > 0),   -- 最小额度单位，正整数
+    issued_at      TEXT NOT NULL,                          -- 发放即生效
+    expire_at      TEXT NOT NULL,                          -- 到期瞬间未用部分作废
+    request_id     TEXT NOT NULL,
+    created_seq    INTEGER NOT NULL,
+    UNIQUE (org, request_id)
+);
+CREATE INDEX IF NOT EXISTS idx_grants_org_expiry
+    ON budget_grants(org, expire_at, created_seq);
+
+-- 计费开启标记：billable_since 是组织第一笔发放的逻辑时刻。已有在线会话
+-- 只从该时刻起计费；该行存在即表示该组织进入预算控制。
+CREATE TABLE IF NOT EXISTS billing_orgs (
+    org            TEXT PRIMARY KEY,
+    billable_since TEXT NOT NULL,
+    enabled_seq    INTEGER NOT NULL
+);
+
+-- 预算用量账：每笔扣费按「会话 × 额度」拆开，可跨多笔额度扣一笔用量。
+-- 扣费区间左闭右开 [start_at, end_at)，与逻辑时钟推进的活跃时段一致。
+-- grant_id 为 NULL 表示该段没有任何可用额度（欠费时段），用于完整对账。
+CREATE TABLE IF NOT EXISTS budget_charges (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    org         TEXT NOT NULL,
+    session_id  TEXT NOT NULL,
+    tier        TEXT NOT NULL,
+    grant_id    TEXT,
+    start_at    TEXT NOT NULL,
+    end_at      TEXT NOT NULL,
+    units       INTEGER NOT NULL CHECK (units >= 0),
+    seq         INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_charges_grant
+    ON budget_charges(grant_id, start_at);
+CREATE INDEX IF NOT EXISTS idx_charges_org_session
+    ON budget_charges(org, session_id, start_at);
+
+-- 预算发放请求幂等账：同组织同 request_id 原样重试返回首次结果；
+-- 改金额或到期时间拒绝。被拒请求同样留痕，重试返回第一次的拒绝。
+CREATE TABLE IF NOT EXISTS budget_requests (
+    request_id     TEXT NOT NULL,
+    org            TEXT NOT NULL,
+    amount         INTEGER NOT NULL,
+    expire_at      TEXT NOT NULL,
+    first_status   TEXT NOT NULL CHECK (first_status IN ('granted', 'rejected')),
+    reject_code    TEXT,
+    response_json  TEXT NOT NULL,
+    created_seq    INTEGER NOT NULL,
+    PRIMARY KEY (org, request_id)
 );

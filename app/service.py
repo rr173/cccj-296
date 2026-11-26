@@ -34,6 +34,9 @@ class ServiceError(Exception):
 
 TIER_PRIORITY = {"premium": 0, "standard": 1}
 
+# 预付预算：每逻辑微秒消耗的最小额度单位（标准 1、高级 3）
+TIER_UNITS = {"standard": 1, "premium": 3}
+
 
 # ---------------------------------------------------------------- 事件与序号
 
@@ -138,7 +141,8 @@ class PlacementPlan:
 
 def _plan_placement(ents: list[sqlite3.Row], sessions: list[sqlite3.Row],
                     current_ents: dict[str, str],
-                    reserve_standard: int, reserve_premium: int) -> PlacementPlan:
+                    reserve_standard: int, reserve_premium: int,
+                    billing_balance: int | None = None) -> PlacementPlan:
     """纯函数：给定权益、会话与离线预留，算出安置结果，不做任何写库。
 
     离线承诺优先：先把预留席位作为「幻影占用」放进池里（高级预留只进高级池，
@@ -146,6 +150,10 @@ def _plan_placement(ents: list[sqlite3.Row], sessions: list[sqlite3.Row],
     可行性检查保证幻影一定放得下；放不下时钳制为池容量（绝不超发）。
     由于保留/撤销只取决于各类池的总余量，幻影在权益间如何分布不影响在线
     会话集合——离线席位不会挡住本可同时容纳的在线会话。
+
+    billing_balance 不为 None 表示该组织已开启计费：逐个会话在分到席位后，
+    还要检查「已选会话接下来 1 微秒的总费用」不超过当前可用额度；付不起的
+    会话撤销并归还刚占的席位、不计入已用预算，继续考虑后面的会话。
     """
     premium_pools: dict[str, list[Any]] = {
         e["ent_id"]: [e["seats"], 0] for e in ents if e["tier"] == "premium"
@@ -184,6 +192,7 @@ def _plan_placement(ents: list[sqlite3.Row], sessions: list[sqlite3.Row],
     retained: list[str] = []
     evicted: list[dict] = []
     assignments: dict[str, str] = {}
+    committed_cost = 0
 
     def take_from(pools: dict[str, list[Any]], preferred: str | None) -> str | None:
         # 优先继续占原有权益，减少无意义迁移
@@ -210,6 +219,16 @@ def _plan_placement(ents: list[sqlite3.Row], sessions: list[sqlite3.Row],
             if chosen is None:
                 reason = "no_any_capacity"
 
+        if chosen is not None and billing_balance is not None:
+            need = TIER_UNITS[s["tier"]]
+            if committed_cost + need > billing_balance:
+                if chosen in premium_pools and premium_pools[chosen][1] > 0:
+                    premium_pools[chosen][1] -= 1
+                else:
+                    standard_pools[chosen][1] -= 1
+                chosen = None
+                reason = "budget_exhausted"
+
         if chosen is None:
             evicted.append(
                 {
@@ -220,6 +239,8 @@ def _plan_placement(ents: list[sqlite3.Row], sessions: list[sqlite3.Row],
                 }
             )
             continue
+        if billing_balance is not None:
+            committed_cost += TIER_UNITS[s["tier"]]
         retained.append(s["session_id"])
         assignments[s["session_id"]] = chosen
 
@@ -231,7 +252,11 @@ def reconcile(conn: sqlite3.Connection, org: str) -> ReconcileResult:
 
     在调用方已经打开的写事务内执行。每次撤销各取一个事件 seq；
     席位迁移只落 slot_history（其 assigned/released seq 同样可追溯）。
+    已开启计费的组织还要逐会话验证「接下来 1 微秒付得起」，付不起的以
+    budget_exhausted 终态撤销（见 _plan_placement 的 billing_balance 参数）。
     """
+    from . import budget
+
     at = db.get_clock(conn)
     ents = _active_entitlements(conn, org, at)
     sessions = _active_sessions(conn, org)
@@ -244,17 +269,22 @@ def reconcile(conn: sqlite3.Connection, org: str) -> ReconcileResult:
         if slot is not None:
             current_ents[s["session_id"]] = slot["ent_id"]
 
+    # 已开启计费的组织：预算余额参与安置（付不起的会话不占席位也不占预算）
+    billable_since = budget.billing_since(conn, org)
+    balance = budget.balance_at(conn, org, at) \
+        if billable_since is not None and billable_since <= at else None
     plan = _plan_placement(ents, sessions, current_ents,
-                           reserve_standard, reserve_premium)
+                           reserve_standard, reserve_premium, billing_balance=balance)
     evicted_ids = {e["session_id"] for e in plan.evicted}
 
     for ev in plan.evicted:
         seq = next_seq(conn)
         old = ev["previous_ent_id"]
+        ev["at"] = at
         conn.execute(
-            "UPDATE sessions SET status='revoked', ended_seq=?, "
+            "UPDATE sessions SET status='revoked', ended_seq=?, ended_at=?, "
             "end_reason=?, current_cred_id=NULL WHERE session_id=?",
-            (seq, ev["reason"], ev["session_id"]),
+            (seq, at, ev["reason"], ev["session_id"]),
         )
         if old is not None:
             conn.execute(
@@ -271,6 +301,7 @@ def reconcile(conn: sqlite3.Connection, org: str) -> ReconcileResult:
                 "tier": ev["tier"],
                 "reason": ev["reason"],
                 "previous_ent_id": old,
+                "at": at,
             },
             seq=seq,
         )
@@ -570,9 +601,9 @@ def close_session(conn: sqlite3.Connection, session_id: str, credential_secret: 
         # 只释放它实际占用的那一份额度
         slot = _open_slot_for(conn, session_id)
         conn.execute(
-            "UPDATE sessions SET status='closed', ended_seq=?, end_reason='closed_by_user', "
-            "current_cred_id=NULL WHERE session_id=?",
-            (seq, session_id),
+            "UPDATE sessions SET status='closed', ended_seq=?, ended_at=?, "
+            "end_reason='closed_by_user', current_cred_id=NULL WHERE session_id=?",
+            (seq, db.get_clock(conn), session_id),
         )
         if slot is not None:
             conn.execute(
@@ -733,8 +764,46 @@ def revoke_entitlement(conn: sqlite3.Connection, ent_id: str, reason: str) -> di
 # ---------------------------------------------------------------- 时间推进
 
 
+def _capacity_signature(conn: sqlite3.Connection, org: str, at: str) -> tuple:
+    """at 时刻席位容量指纹：有效权益集合 + 离线预留。变化点即真实边界。"""
+    ents = _active_entitlements(conn, org, at)
+    ent_sig = tuple(sorted((e["ent_id"], e["tier"], e["seats"]) for e in ents))
+    return (ent_sig, reservation_totals(conn, org, at))
+
+
+def _settle_boundaries(conn: sqlite3.Connection, org: str, lo: str, hi: str) -> list[dict]:
+    """在真实边界 hi 处停用不再合格的会话（预算 + 席位）。
+
+    本段内只对活跃时段扣费；到达边界后重新执行与准入完全一致的贪心规则：
+    逐个会话先看离线承诺之外的席位，再看已选集合接下来 1 微秒的费用是否
+    付得起。因此席位收缩、额度到期或余额耗尽都会在各自真实时刻停用会话，
+    不会拖到推进的终点；已撤销会话不在候选集合内，补发额度也不会复活它。
+    结束时间取该边界时刻本身（停用发生在边界，不晚于它）。
+    """
+    from . import budget
+
+    sessions = _active_sessions(conn, org)
+    if not sessions:
+        return []
+    sig_changed = _capacity_signature(conn, org, lo) != _capacity_signature(conn, org, hi)
+    balance = budget.balance_at(conn, org, hi) \
+        if budget.billing_since(conn, org) is not None else None
+    cost = sum(TIER_UNITS[s["tier"]] for s in sessions)
+    if not sig_changed and (balance is None or cost <= balance):
+        return []
+    # 结算发生在边界时刻 hi：先把逻辑时钟置于该点，再按规则停用
+    boundary = db.get_clock(conn)
+    conn.execute("UPDATE clock SET now_iso=? WHERE id=1", (hi,))
+    try:
+        return reconcile(conn, org).evicted
+    finally:
+        conn.execute("UPDATE clock SET now_iso=? WHERE id=1", (boundary,))
+
+
 def advance_clock(conn: sqlite3.Connection, to_iso: str | None = None,
                   delta_seconds: float | None = None) -> dict:
+    from . import budget
+
     with db.transaction(conn):
         current = db.get_clock(conn)
         if to_iso is not None:
@@ -747,24 +816,59 @@ def advance_clock(conn: sqlite3.Connection, to_iso: str | None = None,
         if target < current:
             raise ServiceError("clock_cannot_go_back", "逻辑时钟不能回拨", 409)
         if target == current:
-            return {"now": current, "advanced": False, "evicted": []}
+            return {"now": current, "advanced": False, "evicted": [],
+                    "charged_units": 0, "segments": 0}
 
-        conn.execute("UPDATE clock SET now_iso=? WHERE id=1", (target,))
-        seq = _emit(conn, "clock.advanced", None, {"from": current, "to": target})
-
-        # 所有有活跃会话的组织都重新确定席位（权益到期/生效都可能改变容量）
-        orgs = [r[0] for r in conn.execute(
-            "SELECT DISTINCT org FROM sessions WHERE status='active'").fetchall()]
+        billable_orgs = set(budget.billing_orgs_with_active_sessions(conn))
+        # 有活跃会话的组织都要在真实边界（席位/额度/余额）处停用不合格会话
+        active_orgs = [r[0] for r in conn.execute(
+            "SELECT DISTINCT org FROM sessions WHERE status='active' ORDER BY org"
+        ).fetchall()]
         all_evicted: list[dict] = []
-        for org in orgs:
-            all_evicted.extend(reconcile(conn, org).evicted)
-        return {"now": target, "advanced": True, "evicted": all_evicted}
+        total_charged = 0
+        segments = 0
+        t = current
+        while t < target:
+            stops: set[str] = {target}
+            for org in active_orgs:
+                stops |= budget.boundary_times(conn, org, t, target)
+                if org in billable_orgs:
+                    k = budget.exhaustion_time(conn, org, t)
+                    if k > 0:
+                        stops.add(budget.add_us(t, k))
+            stops = {s for s in stops if t < s <= target}
+            nxt = min(stops)
+
+            # 起点已付不起哪怕 1 微秒的计费会话先停用，避免产生任何欠费段
+            for org in billable_orgs:
+                if budget.exhaustion_time(conn, org, t) == 0:
+                    all_evicted.extend(reconcile(conn, org).evicted)
+
+            # 只对实际活跃的时段扣费（左闭右开 [t, nxt)）
+            for org in billable_orgs:
+                total_charged += sum(
+                    r["units"] for r in budget.settle_span(conn, org, t, nxt))
+            conn.execute("UPDATE clock SET now_iso=? WHERE id=1", (nxt,))
+            segments += 1
+
+            # 在真实边界停用不再合格的会话（不拖到推进的终点）
+            for org in active_orgs:
+                all_evicted.extend(_settle_boundaries(conn, org, t, nxt))
+            t = nxt
+
+        seq = _emit(conn, "clock.advanced", None,
+                    {"from": current, "to": target, "segments": segments,
+                     "charged_units": total_charged})
+        return {"now": target, "advanced": True, "evicted": all_evicted,
+                "charged_units": total_charged, "segments": segments, "seq": seq}
 
 
 # ---------------------------------------------------------------- 追溯查询
 
 
 def get_session_detail(conn: sqlite3.Connection, session_id: str) -> dict:
+    from . import budget
+
     sess = conn.execute("SELECT * FROM sessions WHERE session_id=?", (session_id,)).fetchone()
     if sess is None:
         raise ServiceError("session_not_found", "会话不存在", 404)
@@ -779,6 +883,7 @@ def get_session_detail(conn: sqlite3.Connection, session_id: str) -> dict:
         "SELECT cred_id, generation, status, issued_seq, consumed_seq "
         "FROM credentials WHERE session_id=? ORDER BY generation", (session_id,)
     ).fetchall()
+    usage = budget.session_usage(conn, session_id)
     return {
         "session_id": sess["session_id"],
         "org": sess["org"],
@@ -786,15 +891,20 @@ def get_session_detail(conn: sqlite3.Connection, session_id: str) -> dict:
         "status": sess["status"],
         "created_seq": sess["created_seq"],
         "ended_seq": sess["ended_seq"],
+        "ended_at": sess["ended_at"],
         "end_reason": sess["end_reason"],
         "admit_request_id": sess["admit_request_id"],
         "admit_first_status": admit["first_status"] if admit else None,
         "slot_history": [dict(s) for s in slots],
         "credentials": [dict(c) for c in creds],
+        "budget_usage": usage,
+        "budget_units": sum(u["units"] for u in usage),
     }
 
 
 def list_org_sessions(conn: sqlite3.Connection, org: str) -> list[dict]:
+    from . import budget
+
     rows = conn.execute(
         "SELECT * FROM sessions WHERE org=? ORDER BY created_seq", (org,)
     ).fetchall()
@@ -803,6 +913,8 @@ def list_org_sessions(conn: sqlite3.Connection, org: str) -> list[dict]:
         slot = _open_slot_for(conn, r["session_id"])
         item = dict(r)
         item["current_ent_id"] = slot["ent_id"] if slot else None
+        item["budget_units"] = sum(
+            u["units"] for u in budget.session_usage(conn, r["session_id"]))
         out.append(item)
     return out
 

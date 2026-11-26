@@ -109,3 +109,87 @@ CREATE TABLE IF NOT EXISTS events (
     at_iso      TEXT NOT NULL,
     detail_json TEXT NOT NULL
 );
+
+-- ================================================================ 组织购权
+-- 套餐目录：价格/币种/权益种类/席位/时长均为预设固定值；订单只引用套餐快照，不能改价。
+-- charge_mode 只是收款方演练用的预设收款方式（direct=直接扣款，freeze=冻结后扣款）。
+CREATE TABLE IF NOT EXISTS packages (
+    code             TEXT PRIMARY KEY,
+    price_cents      INTEGER NOT NULL CHECK (price_cents > 0),
+    currency         TEXT NOT NULL,
+    tier             TEXT NOT NULL CHECK (tier IN ('standard', 'premium')),
+    seats            INTEGER NOT NULL CHECK (seats >= 0),
+    duration_seconds INTEGER NOT NULL CHECK (duration_seconds > 0),
+    charge_mode      TEXT NOT NULL DEFAULT 'direct' CHECK (charge_mode IN ('direct', 'freeze')),
+    created_seq      INTEGER NOT NULL
+);
+
+-- 购买订单状态机：
+--   processing --(确认足额扣款/足额冻结)--> promised --(实际扣款确认)--> delivered
+--   processing/failed --(接受取消)--> cancel_pending --(确认无款终结)--> canceled
+--   processing --(支付明确拒绝且未接受取消)--> failed
+-- promised/delivered 不可取消（明确拒绝），服务继续履约；权益只在 captured 后发放。
+-- 同一组织同一 request_id 唯一；参数（套餐）变化拒绝。
+CREATE TABLE IF NOT EXISTS purchase_orders (
+    order_id            TEXT PRIMARY KEY,
+    org                 TEXT NOT NULL,
+    request_id          TEXT NOT NULL,
+    package_code        TEXT NOT NULL,
+    merchant_order_id   TEXT NOT NULL UNIQUE,
+    price_cents         INTEGER NOT NULL,
+    currency            TEXT NOT NULL,
+    tier                TEXT NOT NULL CHECK (tier IN ('standard', 'premium')),
+    seats               INTEGER NOT NULL,
+    duration_seconds    INTEGER NOT NULL,
+    charge_mode         TEXT NOT NULL CHECK (charge_mode IN ('direct', 'freeze')),
+    status              TEXT NOT NULL CHECK (status IN (
+                            'processing', 'promised', 'delivered',
+                            'failed', 'cancel_pending', 'canceled')),
+    charge_id           TEXT,
+    charge_amount_cents INTEGER,
+    charge_currency     TEXT,
+    charge_state        TEXT NOT NULL DEFAULT 'none' CHECK (charge_state IN (
+                            'none', 'unknown', 'frozen', 'captured',
+                            'voided', 'refunded', 'rejected')),
+    create_attempted    INTEGER NOT NULL DEFAULT 0,
+    create_finished     INTEGER NOT NULL DEFAULT 0,
+    create_outcome      TEXT NOT NULL DEFAULT 'unknown' CHECK (create_outcome IN (
+                            'unknown', 'ok', 'rejected')),
+    delivery_basis      TEXT CHECK (delivery_basis IN ('captured', 'frozen_guarantee')),
+    promised_seq        INTEGER,
+    promised_at_iso     TEXT,
+    issued_ent_id       TEXT,
+    ent_effective_at    TEXT,          -- 实际发放时锁定的窗口；重试/恢复不再重算
+    ent_expire_at       TEXT,
+    ent_at_iso          TEXT,          -- 实际发放时的服务逻辑时间
+    delivered_seq       INTEGER,
+    cancel_request_id   TEXT,
+    cancel_accepted_seq INTEGER,
+    cancel_accepted_at  TEXT,
+    cancel_settlement   TEXT NOT NULL DEFAULT 'none' CHECK (cancel_settlement IN (
+                            'none', 'pending', 'void_confirmed',
+                            'refund_confirmed', 'no_charge')),
+    last_error          TEXT,
+    created_seq         INTEGER NOT NULL,
+    updated_seq         INTEGER NOT NULL,
+    UNIQUE (org, request_id)
+);
+CREATE INDEX IF NOT EXISTS idx_orders_status ON purchase_orders(status, created_seq);
+CREATE INDEX IF NOT EXISTS idx_orders_org ON purchase_orders(org, created_seq);
+
+-- 与独立收款方的每一次交互留痕：ok / rejected（明确业务拒绝）/ unknown（超时或响应丢失）
+CREATE TABLE IF NOT EXISTS purchase_money_ops (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    order_id          TEXT NOT NULL,
+    op_type           TEXT NOT NULL CHECK (op_type IN (
+                          'create', 'query_merchant', 'query_charge',
+                          'capture', 'void', 'refund')),
+    merchant_order_id TEXT NOT NULL,
+    charge_id         TEXT,
+    outcome           TEXT NOT NULL CHECK (outcome IN ('ok', 'rejected', 'unknown')),
+    detail_json       TEXT NOT NULL,
+    seq               INTEGER NOT NULL,
+    at_iso            TEXT NOT NULL,
+    FOREIGN KEY (order_id) REFERENCES purchase_orders(order_id)
+);
+CREATE INDEX IF NOT EXISTS idx_money_ops_order ON purchase_money_ops(order_id, id);

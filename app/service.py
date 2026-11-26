@@ -539,33 +539,48 @@ def _validate_window(effective_at: str, expire_at: str) -> tuple[str, str]:
     return eff, exp
 
 
-def create_entitlement(conn: sqlite3.Connection, org: str, tier: str, seats: int,
-                       effective_at: str, expire_at: str) -> dict:
+def create_entitlement_locked(conn: sqlite3.Connection, org: str, tier: str, seats: int,
+                              effective_at: str, expire_at: str, *,
+                              source: str = "manual", detail: dict | None = None) -> dict:
+    """在调用方已打开的写事务内创建一份权益并立即触发再平衡。
+
+    组织购权的发放也走这里：权益窗口在**实际发放那一刻**由调用方用逻辑时钟算好，
+    与订单发放记录在同一事务里落库，之后的重试/恢复不会再重算窗口。
+    """
     if tier not in ("standard", "premium"):
         raise ServiceError("invalid_tier", "tier 必须是 standard 或 premium", 422)
     if seats < 0:
         raise ServiceError("invalid_seats", "seats 不能为负", 422)
     eff, exp = _validate_window(effective_at, expire_at)
 
-    with db.transaction(conn):
-        ent_id = new_id("ent")
-        seq = _emit(
-            conn,
-            "entitlement.created",
-            org,
-            {"ent_id": ent_id, "tier": tier, "seats": seats,
-             "effective_at": eff, "expire_at": exp},
-        )
-        conn.execute(
-            "INSERT INTO entitlements(ent_id, version, org, tier, seats, effective_at, "
-            "expire_at, status, created_seq) VALUES (?, 1, ?, ?, ?, ?, ?, 'active', ?)",
-            (ent_id, org, tier, seats, eff, exp, seq),
-        )
-        result = reconcile(conn, org)
-        return {"entitlement": _dump_ent(
+    ent_id = new_id("ent")
+    event_detail = {"ent_id": ent_id, "tier": tier, "seats": seats,
+                    "effective_at": eff, "expire_at": exp, "source": source}
+    if detail:
+        event_detail.update(detail)
+    seq = _emit(conn, "entitlement.created", org, event_detail)
+    conn.execute(
+        "INSERT INTO entitlements(ent_id, version, org, tier, seats, effective_at, "
+        "expire_at, status, created_seq) VALUES (?, 1, ?, ?, ?, ?, ?, 'active', ?)",
+        (ent_id, org, tier, seats, eff, exp, seq),
+    )
+    result = reconcile(conn, org)
+    return {
+        "ent_id": ent_id,
+        "seq": seq,
+        "entitlement": _dump_ent(
             conn.execute("SELECT * FROM entitlements WHERE ent_id=? AND version=1",
                          (ent_id,)).fetchone()),
-            "evicted": result.evicted}
+        "evicted": result.evicted,
+    }
+
+
+def create_entitlement(conn: sqlite3.Connection, org: str, tier: str, seats: int,
+                       effective_at: str, expire_at: str) -> dict:
+    with db.transaction(conn):
+        out = create_entitlement_locked(
+            conn, org, tier, seats, effective_at, expire_at, source="manual")
+        return {"entitlement": out["entitlement"], "evicted": out["evicted"]}
 
 
 def modify_entitlement(conn: sqlite3.Connection, ent_id: str, *, seats: int | None = None,
